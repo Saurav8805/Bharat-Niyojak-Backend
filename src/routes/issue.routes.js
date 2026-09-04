@@ -2,7 +2,8 @@ const express = require('express');
 const router = express.Router();
 const multer = require('multer');
 const { GoogleGenerativeAI } = require('@google/generative-ai');
-const supabase = require('../config/supabase');
+const { supabase } = require('../config/supabase');
+const { authenticateToken } = require('../middleware/auth.middleware');
 
 // Configure multer for image uploads
 const storage = multer.memoryStorage();
@@ -26,12 +27,25 @@ const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
  * @desc    Report new issue with AI analysis
  * @access  Private (Citizen)
  */
-router.post('/report', upload.single('image'), async (req, res) => {
+router.post('/report', authenticateToken, upload.single('image'), async (req, res) => {
   try {
     const { description, latitude, longitude, address } = req.body;
     const userId = req.user?.id || req.body.userId; // From auth middleware
 
+    console.log('=== Report Issue Request ===');
+    console.log('User ID:', userId);
+    console.log('Description:', description?.substring(0, 50));
+    console.log('Location:', { latitude, longitude });
+    console.log('Has image:', !!req.file);
+
     // Validation
+    if (!userId) {
+      return res.status(401).json({
+        success: false,
+        message: 'User authentication required'
+      });
+    }
+
     if (!req.file) {
       return res.status(400).json({
         success: false,
@@ -47,6 +61,7 @@ router.post('/report', upload.single('image'), async (req, res) => {
     }
 
     // Upload image to Supabase Storage
+    console.log('Uploading image to Supabase...');
     const fileName = `${Date.now()}-${req.file.originalname}`;
     const { data: uploadData, error: uploadError } = await supabase.storage
       .from('issue-images')
@@ -59,33 +74,63 @@ router.post('/report', upload.single('image'), async (req, res) => {
       console.error('Image upload error:', uploadError);
       return res.status(500).json({
         success: false,
-        message: 'Failed to upload image'
+        message: 'Failed to upload image: ' + uploadError.message
       });
     }
+
+    console.log('Image uploaded successfully:', fileName);
 
     // Get public URL
     const { data: { publicUrl } } = supabase.storage
       .from('issue-images')
       .getPublicUrl(fileName);
 
-    // AI Analysis using Gemini Vision
-    console.log('Starting AI analysis...');
+    // AI Analysis using Gemini Vision (REQUIRED - with automatic fallback)
+    let aiAnalysis;
+    console.log('Starting AI analysis with Gemini...');
+    console.log('API Key exists:', !!process.env.GEMINI_API_KEY);
     
-    const model = genAI.getGenerativeModel({ model: 'gemini-1.5-flash' });
+    // Try multiple models in order of preference
+    const modelsToTry = [
+      'gemini-flash-latest',
+      'gemini-2.5-flash',
+      'gemini-3.8-flash',
+      'gemini-3.5-flash'
+    ];
     
-    // Convert image buffer to base64
-    const imageBase64 = req.file.buffer.toString('base64');
+    let lastError = null;
+    let modelUsed = null;
     
-    const prompt = `Analyze this civic issue image and provide:
-1. A detailed description of the problem (2-3 sentences)
-2. The severity level (low, medium, high, critical)
-3. The appropriate department (must be one of: electric, road, water, forest)
-4. Estimated category/type of issue
+    for (const modelName of modelsToTry) {
+      try {
+        console.log(`Trying model: ${modelName}`);
+        const model = genAI.getGenerativeModel({ model: modelName });
+      
+      const imageBase64 = req.file.buffer.toString('base64');
+      
+      const prompt = `You are an AI assistant for a civic issue reporting system in India. Analyze this image carefully and classify it into the correct department.
+
+CRITICAL: You MUST choose the correct department from: electric, road, water, forest
+
+Common department classifications:
+- ELECTRIC: Power lines, transformers, street lights, electrical poles, wire issues, power outages
+- ROAD: Potholes, road damage, traffic signs, road construction, blocked roads, broken pavements
+- WATER: Water leaks, drainage issues, sewage problems, pipe bursts, water supply issues, flooding
+- FOREST: Tree-related issues, forest fires, illegal logging, wildlife problems, park maintenance
 
 User's description: "${description}"
 Location: ${address || `${latitude}, ${longitude}`}
 
-Response format (JSON only):
+Analyze the image and user description to determine:
+1. A detailed description of the problem (2-3 sentences)
+2. The severity level (low, medium, high, critical)
+3. The CORRECT department (electric, road, water, or forest) - BE VERY CAREFUL HERE
+4. Estimated category/type of issue
+
+IMPORTANT: If the image shows water-related issues (pipes, leaks, drainage, sewage), choose "water" department, NOT road!
+If the image shows electrical issues (wires, poles, transformers), choose "electric" department!
+
+Response format (JSON only, no markdown):
 {
   "detailed_description": "string",
   "severity": "low|medium|high|critical",
@@ -94,54 +139,88 @@ Response format (JSON only):
   "confidence": 0.0-1.0
 }`;
 
-    const result = await model.generateContent([
-      { text: prompt },
-      {
-        inlineData: {
-          mimeType: req.file.mimetype,
-          data: imageBase64
-        }
-      }
-    ]);
+        const result = await model.generateContent([
+          prompt,
+          {
+            inlineData: {
+              mimeType: req.file.mimetype,
+              data: imageBase64
+            }
+          }
+        ]);
 
-    const response = await result.response;
-    const aiText = response.text();
+        const response = result.response;
+        const aiText = response.text();
+        
+        console.log('AI Raw Response:', aiText);
+        
+        // Parse AI response
+        let jsonMatch = aiText.match(/\{[\s\S]*\}/);
+        if (!jsonMatch) {
+          const codeBlockMatch = aiText.match(/```(?:json)?\s*(\{[\s\S]*?\})\s*```/);
+          if (codeBlockMatch) {
+            jsonMatch = [codeBlockMatch[1]];
+          } else {
+            throw new Error('No JSON found in AI response');
+          }
+        }
+        
+        aiAnalysis = JSON.parse(jsonMatch[0]);
+        
+        // Validate department
+        const validDepartments = ['electric', 'road', 'water', 'forest'];
+        if (!validDepartments.includes(aiAnalysis.department)) {
+          throw new Error(`Invalid department: ${aiAnalysis.department}`);
+        }
+        
+        modelUsed = modelName;
+        console.log(`✓ AI Analysis successful with ${modelName}:`, aiAnalysis);
+        break; // Success! Exit the loop
+        
+      } catch (modelError) {
+        console.error(`✗ Model ${modelName} failed:`, modelError.message);
+        lastError = modelError;
+        
+        // If it's a 503 (service unavailable), try next model
+        // If it's other errors, also try next model
+        continue;
+      }
+    }
     
-    // Parse AI response
-    let aiAnalysis;
-    try {
-      // Extract JSON from response
-      const jsonMatch = aiText.match(/\{[\s\S]*\}/);
-      aiAnalysis = JSON.parse(jsonMatch[0]);
-    } catch (e) {
-      console.error('AI parsing error:', e);
-      // Fallback to basic analysis
-      aiAnalysis = {
-        detailed_description: description,
-        severity: 'medium',
-        department: 'road', // Default
-        category: 'General Issue',
-        confidence: 0.5
-      };
+    // If all models failed
+    if (!aiAnalysis) {
+      console.error('❌ All AI models failed - BLOCKING ISSUE SUBMISSION');
+      console.error('Last error:', lastError?.message);
+      
+      return res.status(503).json({
+        success: false,
+        message: 'AI service is temporarily unavailable. Please try again in a few moments.',
+        error: lastError?.message,
+        details: 'All AI models are currently experiencing high demand. Please wait a moment and try again.'
+      });
     }
 
-    console.log('AI Analysis:', aiAnalysis);
-
-    // Check for duplicate issues with enhanced AI comparison
+    // Check for duplicate issues with AI-powered image and text comparison
+    console.log('Checking for duplicate issues...');
     const { data: recentIssues } = await supabase
       .from('issues')
-      .select('id, latitude, longitude, images, description, ai_description, department')
+      .select('id, latitude, longitude, images, description, ai_description, department, reported_at')
       .gte('reported_at', new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString()) // Last 7 days
       .eq('department', aiAnalysis.department) // Same department only
-      .limit(100);
+      .limit(50); // Limit to 50 most recent
 
     let isDuplicate = false;
     let duplicateIssueId = null;
     let similarityScore = 0;
 
     if (recentIssues && recentIssues.length > 0) {
-      // Enhanced duplicate detection with location and description similarity
+      console.log(`Found ${recentIssues.length} recent issues in ${aiAnalysis.department} department`);
+      
+      // Get the model that worked for AI analysis
+      const workingModel = genAI.getGenerativeModel({ model: modelUsed || 'gemini-flash-latest' });
+      
       for (const issue of recentIssues) {
+        // Calculate distance
         const distance = calculateDistance(
           parseFloat(latitude),
           parseFloat(longitude),
@@ -149,46 +228,96 @@ Response format (JSON only):
           issue.longitude
         );
         
-        // If within 200 meters and same department, check description similarity
-        if (distance < 0.2) { // 0.2 km = 200 meters
-          // Calculate text similarity using AI
+        // Only check issues within 500 meters (0.5 km)
+        if (distance < 0.5) {
+          console.log(`Checking issue ${issue.id} - Distance: ${(distance * 1000).toFixed(0)}m`);
+          
           try {
-            const similarityPrompt = `Compare these two issue descriptions and determine if they are reporting the same problem.
-            
-Issue 1 (New): ${aiAnalysis.detailed_description}
-Location 1: ${address || `${latitude}, ${longitude}`}
+            // Enhanced AI-powered duplicate detection with IMAGE comparison
+            let comparisonPrompt = `You are analyzing whether two civic issue reports are duplicates.
 
-Issue 2 (Existing): ${issue.ai_description || issue.description}
-Location 2: Around ${distance.toFixed(2)} km away
+NEW ISSUE:
+- Description: ${aiAnalysis.detailed_description}
+- User said: "${description}"
+- Location: ${address || `${latitude}, ${longitude}`}
+- Distance from existing issue: ${(distance * 1000).toFixed(0)} meters
+- Department: ${aiAnalysis.department}
 
-Are these the same issue? Consider:
-- Physical proximity (${distance.toFixed(3)} km apart)
-- Problem description similarity
-- Same department (${aiAnalysis.department})
+EXISTING ISSUE (reported ${Math.floor((Date.now() - new Date(issue.reported_at).getTime()) / (1000 * 60 * 60))} hours ago):
+- Description: ${issue.ai_description || issue.description}
+- Department: ${issue.department}
+
+IMPORTANT: Look at BOTH images carefully. Compare:
+1. Visual similarity - Are they showing the SAME physical location/problem?
+2. Problem type - Same type of damage/issue?
+3. Physical proximity - Only ${(distance * 1000).toFixed(0)} meters apart
+4. Time - ${Math.floor((Date.now() - new Date(issue.reported_at).getTime()) / (1000 * 60 * 60))} hours between reports
+
+If the images show the SAME location and SAME problem, mark as duplicate even if descriptions differ slightly.
 
 Respond with JSON only:
 {
   "is_duplicate": true/false,
   "confidence": 0.0-1.0,
-  "reason": "brief explanation"
+  "reason": "brief explanation focusing on image comparison"
 }`;
 
-            const similarityResult = await model.generateContent(similarityPrompt);
+            // Prepare images for comparison
+            const comparisonContent = [comparisonPrompt];
+            
+            // Add new issue image
+            comparisonContent.push({
+              inlineData: {
+                mimeType: req.file.mimetype,
+                data: imageBase64
+              }
+            });
+            
+            // Add existing issue image if available
+            if (issue.images && issue.images.length > 0) {
+              try {
+                // Fetch the existing issue image
+                const existingImageUrl = issue.images[0];
+                const imageResponse = await fetch(existingImageUrl);
+                const imageBuffer = await imageResponse.arrayBuffer();
+                const existingImageBase64 = Buffer.from(imageBuffer).toString('base64');
+                
+                comparisonContent.push({
+                  inlineData: {
+                    mimeType: 'image/jpeg', // Assume JPEG, adjust if needed
+                    data: existingImageBase64
+                  }
+                });
+                
+                console.log('Comparing with existing issue image...');
+              } catch (imgError) {
+                console.error('Error fetching existing image:', imgError.message);
+                // Continue without image comparison
+              }
+            }
+
+            const similarityResult = await workingModel.generateContent(comparisonContent);
             const similarityResponse = await similarityResult.response;
             const similarityText = similarityResponse.text();
             
-            const similarityJson = JSON.parse(similarityText.match(/\{[\s\S]*\}/)[0]);
-            
-            if (similarityJson.is_duplicate && similarityJson.confidence > 0.7) {
-              isDuplicate = true;
-              duplicateIssueId = issue.id;
-              similarityScore = similarityJson.confidence;
-              console.log(`Duplicate detected: ${similarityJson.reason}`);
-              break;
+            const jsonMatch = similarityText.match(/\{[\s\S]*\}/);
+            if (jsonMatch) {
+              const similarityJson = JSON.parse(jsonMatch[0]);
+              
+              console.log(`Similarity check: ${similarityJson.is_duplicate ? 'DUPLICATE' : 'Different'} (${Math.round(similarityJson.confidence * 100)}% confidence) - ${similarityJson.reason}`);
+              
+              // Mark as duplicate if confidence > 70%
+              if (similarityJson.is_duplicate && similarityJson.confidence > 0.7) {
+                isDuplicate = true;
+                duplicateIssueId = issue.id;
+                similarityScore = similarityJson.confidence;
+                console.log(`✓ Duplicate detected! Issue ID: ${issue.id}`);
+                break;
+              }
             }
           } catch (e) {
-            console.error('Similarity check error:', e);
-            // Fallback to distance-only check
+            console.error('AI similarity check error:', e.message);
+            // Fallback to distance-only check for very close issues
             if (distance < 0.05) { // 50 meters
               isDuplicate = true;
               duplicateIssueId = issue.id;
@@ -298,7 +427,7 @@ Respond with JSON only:
  * @desc    Get citizen's reported issues
  * @access  Private (Citizen)
  */
-router.get('/my-issues', async (req, res) => {
+router.get('/my-issues', authenticateToken, async (req, res) => {
   try {
     const userId = req.user?.id || req.query.userId;
 
@@ -536,7 +665,233 @@ router.patch('/:id/status', async (req, res) => {
   }
 });
 
+/**
+ * @route   PUT /api/issues/:id
+ * @desc    Update citizen's own issue (only if pending status)
+ * @access  Private (Citizen)
+ */
+router.put('/:id', authenticateToken, upload.single('image'), async (req, res) => {
+  try {
+    const { id } = req.params;
+    const userId = req.user.id;
+    const { description, latitude, longitude, address } = req.body;
+
+    // Check if issue exists and belongs to the user
+    const { data: existingIssue, error: fetchError } = await supabase
+      .from('issues')
+      .select('*')
+      .eq('id', id)
+      .eq('citizen_id', userId)
+      .single();
+
+    if (fetchError || !existingIssue) {
+      return res.status(404).json({
+        success: false,
+        message: 'Issue not found or you do not have permission to update it'
+      });
+    }
+
+    // Only allow editing if status is pending
+    if (existingIssue.status !== 'pending') {
+      return res.status(403).json({
+        success: false,
+        message: 'Cannot edit issue that is already being processed. Only pending issues can be edited.'
+      });
+    }
+
+    const updateData = {};
+    
+    if (description) updateData.description = description;
+    if (latitude) updateData.latitude = parseFloat(latitude);
+    if (longitude) updateData.longitude = parseFloat(longitude);
+    if (address) updateData.address = address;
+
+    // Handle new image upload
+    if (req.file) {
+      const fileName = `${Date.now()}-${req.file.originalname}`;
+      const { error: uploadError } = await supabase.storage
+        .from('issue-images')
+        .upload(fileName, req.file.buffer, {
+          contentType: req.file.mimetype,
+          upsert: false
+        });
+
+      if (uploadError) {
+        console.error('Image upload error:', uploadError);
+        return res.status(500).json({
+          success: false,
+          message: 'Failed to upload new image'
+        });
+      }
+
+      const { data: { publicUrl } } = supabase.storage
+        .from('issue-images')
+        .getPublicUrl(fileName);
+
+      updateData.images = [publicUrl];
+    }
+
+    // Update issue
+    const { data: updatedIssue, error: updateError } = await supabase
+      .from('issues')
+      .update(updateData)
+      .eq('id', id)
+      .select()
+      .single();
+
+    if (updateError) {
+      console.error('Update error:', updateError);
+      return res.status(500).json({
+        success: false,
+        message: 'Failed to update issue'
+      });
+    }
+
+    // Log the update
+    await supabase.from('issue_updates').insert({
+      issue_id: id,
+      user_id: userId,
+      update_type: 'updated',
+      comment: 'Issue details updated by citizen'
+    });
+
+    res.json({
+      success: true,
+      message: 'Issue updated successfully',
+      data: { issue: updatedIssue }
+    });
+
+  } catch (error) {
+    console.error('Update issue error:', error);
+    res.status(500).json({
+      success: false,
+      message: error.message || 'Failed to update issue'
+    });
+  }
+});
+
+/**
+ * @route   DELETE /api/issues/:id
+ * @desc    Delete citizen's own issue (only if pending status)
+ * @access  Private (Citizen)
+ */
+router.delete('/:id', authenticateToken, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const userId = req.user.id;
+
+    console.log('=== Delete Issue Request ===');
+    console.log('Issue ID:', id);
+    console.log('User ID:', userId);
+
+    // Check if issue exists and belongs to the user
+    const { data: existingIssue, error: fetchError } = await supabase
+      .from('issues')
+      .select('*')
+      .eq('id', id)
+      .eq('citizen_id', userId)
+      .single();
+
+    if (fetchError) {
+      console.error('Fetch error:', fetchError);
+      return res.status(404).json({
+        success: false,
+        message: 'Issue not found or you do not have permission to delete it',
+        error: fetchError.message
+      });
+    }
+
+    if (!existingIssue) {
+      return res.status(404).json({
+        success: false,
+        message: 'Issue not found or you do not have permission to delete it'
+      });
+    }
+
+    console.log('Found issue:', { id: existingIssue.id, status: existingIssue.status });
+
+    // Only allow deleting if status is pending
+    if (existingIssue.status !== 'pending') {
+      return res.status(403).json({
+        success: false,
+        message: 'Cannot delete issue that is already being processed. Only pending issues can be deleted.'
+      });
+    }
+
+    // Delete related notifications first
+    console.log('Deleting related notifications...');
+    const { error: notifDeleteError } = await supabase
+      .from('notifications')
+      .delete()
+      .eq('related_issue_id', id);
+
+    if (notifDeleteError) {
+      console.error('Notification delete error:', notifDeleteError);
+      // Continue anyway - not critical
+    }
+
+    // Delete issue updates
+    console.log('Deleting issue updates...');
+    const { error: updatesDeleteError } = await supabase
+      .from('issue_updates')
+      .delete()
+      .eq('issue_id', id);
+
+    if (updatesDeleteError) {
+      console.error('Updates delete error:', updatesDeleteError);
+      // Continue anyway - not critical
+    }
+
+    // Delete the issue
+    console.log('Deleting issue...');
+    const { error: deleteError } = await supabase
+      .from('issues')
+      .delete()
+      .eq('id', id);
+
+    if (deleteError) {
+      console.error('Delete error:', deleteError);
+      return res.status(500).json({
+        success: false,
+        message: 'Failed to delete issue: ' + deleteError.message,
+        error: deleteError
+      });
+    }
+
+    // Optional: Delete images from storage
+    if (existingIssue.images && existingIssue.images.length > 0) {
+      console.log('Deleting images from storage...');
+      for (const imageUrl of existingIssue.images) {
+        try {
+          const fileName = imageUrl.split('/').pop();
+          await supabase.storage
+            .from('issue-images')
+            .remove([fileName]);
+        } catch (imgError) {
+          console.error('Image delete error:', imgError);
+          // Continue anyway - not critical
+        }
+      }
+    }
+
+    console.log('✓ Issue deleted successfully');
+    res.json({
+      success: true,
+      message: 'Issue deleted successfully'
+    });
+
+  } catch (error) {
+    console.error('Delete issue error:', error);
+    res.status(500).json({
+      success: false,
+      message: error.message || 'Failed to delete issue',
+      error: error.toString()
+    });
+  }
+});
+
 module.exports = router;
+
 
 
 /**

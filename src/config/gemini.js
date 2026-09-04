@@ -14,7 +14,7 @@ async function analyzeImage(imageBase64, mimeType = 'image/jpeg') {
   }
 
   try {
-    const model = genAI.getGenerativeModel({ model: 'gemini-1.5-flash' });
+    const model = genAI.getGenerativeModel({ model: 'gemini-1.5-flash-latest' });
 
     const prompt = `You are an AI assistant for a civic issue reporting system in India. Analyze this image and provide the following information in JSON format:
 

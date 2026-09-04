@@ -10,6 +10,8 @@ const complaintRoutes = require('./routes/complaint.routes');
 const userRoutes = require('./routes/user.routes');
 const departmentRoutes = require('./routes/department.routes');
 const aiRoutes = require('./routes/ai.routes');
+const issueRoutes = require('./routes/issue.routes');
+const adminRoutes = require('./routes/admin.routes');
 
 const app = express();
 const PORT = process.env.PORT || 5000;
@@ -42,6 +44,8 @@ app.use('/api/complaints', complaintRoutes);
 app.use('/api/users', userRoutes);
 app.use('/api/departments', departmentRoutes);
 app.use('/api/ai', aiRoutes);
+app.use('/api/issues', issueRoutes);
+app.use('/api/admin', adminRoutes);
 
 // 404 handler
 app.use((req, res) => {

@@ -9,13 +9,13 @@ const JWT_SECRET = process.env.JWT_SECRET || 'your-secret-key';
 // Register new user
 router.post('/register', async (req, res) => {
   try {
-    const { full_name, email, mobile, password, role = 'citizen' } = req.body;
+    const { full_name, email, phone_number, password } = req.body;
 
     // Validation
-    if (!full_name || !email || !mobile || !password) {
+    if (!full_name || !email || !password) {
       return res.status(400).json({
         success: false,
-        message: 'All fields are required'
+        message: 'Name, email, and password are required'
       });
     }
 
@@ -23,13 +23,13 @@ router.post('/register', async (req, res) => {
     const { data: existingUser } = await supabase
       .from('users')
       .select('id')
-      .or(`email.eq.${email},mobile.eq.${mobile}`)
+      .eq('email', email)
       .single();
 
     if (existingUser) {
       return res.status(400).json({
         success: false,
-        message: 'User with this email or mobile already exists'
+        message: 'User with this email already exists'
       });
     }
 
@@ -37,25 +37,23 @@ router.post('/register', async (req, res) => {
     const salt = await bcrypt.genSalt(10);
     const password_hash = await bcrypt.hash(password, salt);
 
-    // Create user
+    // Create user in database
     const { data: newUser, error } = await supabase
       .from('users')
       .insert({
-        full_name,
         email,
-        mobile,
         password_hash,
-        role
+        full_name,
+        phone_number: phone_number || null,
+        role: 'citizen',
+        is_active: true
       })
-      .select()
+      .select('id, full_name, email, phone_number, role, is_active, created_at')
       .single();
 
     if (error) throw error;
 
-    // Remove password from response
-    delete newUser.password_hash;
-
-    // Generate token
+    // Generate JWT token
     const token = jwt.sign(
       { id: newUser.id, email: newUser.email, role: newUser.role },
       JWT_SECRET,
@@ -85,6 +83,8 @@ router.post('/login', async (req, res) => {
   try {
     const { email, password } = req.body;
 
+    console.log('Login attempt:', { email, passwordLength: password?.length });
+
     // Validation
     if (!email || !password) {
       return res.status(400).json({
@@ -93,14 +93,16 @@ router.post('/login', async (req, res) => {
       });
     }
 
-    // Find user
-    const { data: user, error } = await supabase
+    // Get user with password hash
+    const { data: user, error: userError } = await supabase
       .from('users')
       .select('*')
       .eq('email', email)
       .single();
 
-    if (error || !user) {
+    console.log('User lookup result:', { found: !!user, error: userError?.message });
+
+    if (userError || !user) {
       return res.status(401).json({
         success: false,
         message: 'Invalid email or password'
@@ -117,6 +119,8 @@ router.post('/login', async (req, res) => {
 
     // Verify password
     const isPasswordValid = await bcrypt.compare(password, user.password_hash);
+    
+    console.log('Password verification:', { isValid: isPasswordValid });
 
     if (!isPasswordValid) {
       return res.status(401).json({
@@ -125,21 +129,27 @@ router.post('/login', async (req, res) => {
       });
     }
 
-    // Remove password from response
-    delete user.password_hash;
+    // Update last login
+    await supabase
+      .from('users')
+      .update({ last_login: new Date().toISOString() })
+      .eq('id', user.id);
 
-    // Generate token
+    // Generate JWT token
     const token = jwt.sign(
-      { id: user.id, email: user.email, role: user.role },
+      { id: user.id, email: user.email, role: user.role, department: user.department },
       JWT_SECRET,
       { expiresIn: '7d' }
     );
+
+    // Remove password hash from response
+    const { password_hash, ...userWithoutPassword } = user;
 
     res.json({
       success: true,
       message: 'Login successful',
       data: {
-        user,
+        user: userWithoutPassword,
         token
       }
     });
@@ -170,7 +180,7 @@ router.get('/me', async (req, res) => {
 
     const { data: user, error } = await supabase
       .from('users')
-      .select('id, full_name, email, mobile, role, is_active, created_at')
+      .select('id, full_name, email, phone_number, role, department, is_active, created_at')
       .eq('id', decoded.id)
       .single();
 

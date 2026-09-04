@@ -14,7 +14,7 @@ router.get('/', async (req, res) => {
       .from('complaints')
       .select(`
         *,
-        user:users(id, full_name, email, mobile),
+        user:users(id, full_name, email, phone_number),
         department:departments(id, department_name, short_name)
       `)
       .order('created_at', { ascending: false });
@@ -51,7 +51,7 @@ router.get('/:id', async (req, res) => {
       .from('complaints')
       .select(`
         *,
-        user:users(id, full_name, email, mobile),
+        user:users(id, full_name, email, phone_number),
         department:departments(id, department_name, short_name),
         assigned_user:users!assigned_to(id, full_name, email)
       `)

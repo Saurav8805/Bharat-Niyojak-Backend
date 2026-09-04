@@ -47,17 +47,9 @@ function authorizeRoles(...roles) {
   };
 }
 
-// Check if user is admin (any department admin or super admin)
+// Check if user is admin
 function isAdmin(req, res, next) {
-  const adminRoles = [
-    'road_admin',
-    'water_admin',
-    'electricity_admin',
-    'forest_admin',
-    'super_admin'
-  ];
-
-  if (!req.user || !adminRoles.includes(req.user.role)) {
+  if (!req.user || req.user.role !== 'admin') {
     return res.status(403).json({ 
       success: false, 
       message: 'Admin access required' 
@@ -67,21 +59,8 @@ function isAdmin(req, res, next) {
   next();
 }
 
-// Check if user is super admin
-function isSuperAdmin(req, res, next) {
-  if (!req.user || req.user.role !== 'super_admin') {
-    return res.status(403).json({ 
-      success: false, 
-      message: 'Super admin access required' 
-    });
-  }
-
-  next();
-}
-
 module.exports = {
   authenticateToken,
   authorizeRoles,
-  isAdmin,
-  isSuperAdmin
+  isAdmin
 };

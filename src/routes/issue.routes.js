@@ -381,20 +381,25 @@ Respond with JSON only:
     if (departmentAdmins && departmentAdmins.length > 0) {
       const notifications = departmentAdmins.map(admin => ({
         user_id: admin.id,
-        title: 'New Issue Reported',
-        message: `A new ${aiAnalysis.severity} priority issue has been reported in your department: ${issue.title}`,
-        type: 'new_issue',
+        title: isDuplicate ? '⚠️ Duplicate Issue Detected' : 'New Issue Reported',
+        message: isDuplicate 
+          ? `A potential duplicate issue has been reported in your department: ${issue.title}. Similarity: ${Math.round(similarityScore * 100)}%. Please review both issues.`
+          : `A new ${aiAnalysis.severity} priority issue has been reported in your department: ${issue.title}`,
+        type: isDuplicate ? 'duplicate_issue' : 'new_issue',
         related_issue_id: issue.id
       }));
 
       await supabase.from('notifications').insert(notifications);
+      console.log(`✓ Notified ${departmentAdmins.length} admin(s) - Duplicate: ${isDuplicate}`);
     }
 
     // Notify citizen of successful submission
     await supabase.from('notifications').insert({
       user_id: userId,
-      title: 'Issue Reported Successfully',
-      message: `Your issue "${issue.title}" has been reported and assigned to the ${aiAnalysis.department} department.`,
+      title: isDuplicate ? '⚠️ Possible Duplicate Detected' : 'Issue Reported Successfully',
+      message: isDuplicate
+        ? `Your issue "${issue.title}" has been reported. Note: A similar issue was reported recently. Admins will review both reports.`
+        : `Your issue "${issue.title}" has been reported and assigned to the ${aiAnalysis.department} department.`,
       type: 'issue_submitted',
       related_issue_id: issue.id
     });

@@ -150,15 +150,78 @@ router.patch('/:id/status', authenticateToken, isAdmin, async (req, res) => {
     const { id } = req.params;
     const { status, remarks } = req.body;
 
+    // Validate status
+    const validStatuses = ['pending', 'in_progress', 'resolved', 'rejected'];
+    if (!validStatuses.includes(status)) {
+      return res.status(400).json({
+        success: false,
+        message: 'Invalid status. Must be one of: pending, in_progress, resolved, rejected'
+      });
+    }
+
     // Get current complaint
-    const { data: currentComplaint } = await supabase
+    const { data: currentComplaint, error: fetchError } = await supabase
       .from('complaints')
-      .select('status')
+      .select('status, department_id')
       .eq('id', id)
       .single();
 
+    if (fetchError || !currentComplaint) {
+      return res.status(404).json({
+        success: false,
+        message: 'Complaint not found'
+      });
+    }
+
+    // Check if admin belongs to the complaint's department
+    const adminRole = req.user.role; // e.g., 'road_admin'
+    const adminDepartment = adminRole.replace('_admin', ''); // e.g., 'road'
+
+    // Get department from database
+    const { data: department } = await supabase
+      .from('departments')
+      .select('id, department_name')
+      .eq('id', currentComplaint.department_id)
+      .single();
+
+    // Verify admin has access to this department's complaints
+    if (department && !department.department_name.toLowerCase().includes(adminDepartment)) {
+      return res.status(403).json({
+        success: false,
+        message: 'You can only update complaints from your department'
+      });
+    }
+
+    // Validate status transitions
+    const currentStatus = currentComplaint.status;
+    const allowedTransitions = {
+      'submitted': ['pending', 'rejected'],
+      'pending': ['in_progress', 'rejected'],
+      'in_progress': ['resolved', 'rejected']
+    };
+
+    if (allowedTransitions[currentStatus] && !allowedTransitions[currentStatus].includes(status)) {
+      return res.status(400).json({
+        success: false,
+        message: `Cannot change status from ${currentStatus} to ${status}. Allowed: ${allowedTransitions[currentStatus].join(', ')}`
+      });
+    }
+
+    // Require remarks for rejected status
+    if (status === 'rejected' && (!remarks || remarks.trim().length < 10)) {
+      return res.status(400).json({
+        success: false,
+        message: 'Remarks are required for rejected status (minimum 10 characters)'
+      });
+    }
+
     // Update complaint
-    const updateData = { status, updated_at: new Date().toISOString() };
+    const updateData = { 
+      status, 
+      updated_at: new Date().toISOString(),
+      assigned_to: req.user.id
+    };
+    
     if (status === 'resolved') {
       updateData.resolved_at = new Date().toISOString();
     }
@@ -177,15 +240,15 @@ router.patch('/:id/status', authenticateToken, isAdmin, async (req, res) => {
       .from('status_logs')
       .insert({
         complaint_id: id,
-        old_status: currentComplaint?.status,
+        old_status: currentStatus,
         new_status: status,
         updated_by: req.user.id,
-        remarks
+        remarks: remarks || null
       });
 
     res.json({
       success: true,
-      message: 'Complaint status updated',
+      message: 'Complaint status updated successfully',
       data
     });
   } catch (error) {

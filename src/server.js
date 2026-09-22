@@ -12,6 +12,7 @@ const departmentRoutes = require('./routes/department.routes');
 const aiRoutes = require('./routes/ai.routes');
 const issueRoutes = require('./routes/issue.routes');
 const adminRoutes = require('./routes/admin.routes');
+const superadminRoutes = require('./routes/superadmin.routes');
 
 const app = express();
 const PORT = process.env.PORT || 5000;
@@ -66,6 +67,7 @@ app.use('/api/departments', departmentRoutes);
 app.use('/api/ai', aiRoutes);
 app.use('/api/issues', issueRoutes);
 app.use('/api/admin', adminRoutes);
+app.use('/api/superadmin', superadminRoutes);
 
 // 404 handler
 app.use((req, res) => {

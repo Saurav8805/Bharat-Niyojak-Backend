@@ -427,6 +427,36 @@ Respond with JSON only:
   }
 });
 
+// Helper to extract and format proof of resolution image
+function formatIssueWithProof(issue) {
+  if (!issue) return issue;
+  let resolvedImage = null;
+
+  // 1. Check issue_updates for [PROOF_IMAGE:...] tag
+  if (issue.issue_updates && Array.isArray(issue.issue_updates)) {
+    for (const update of issue.issue_updates) {
+      if (update.comment && update.comment.includes('[PROOF_IMAGE:')) {
+        const match = update.comment.match(/\[PROOF_IMAGE:(.*?)\]/);
+        if (match && match[1]) {
+          resolvedImage = match[1].trim();
+          break;
+        }
+      }
+    }
+  }
+
+  // 2. If status is resolved and images array has > 1 images, last is resolution proof
+  if (!resolvedImage && (issue.status === 'resolved' || issue.resolved_at) && Array.isArray(issue.images) && issue.images.length > 1) {
+    resolvedImage = issue.images[issue.images.length - 1];
+  }
+
+  return {
+    ...issue,
+    reported_image: issue.images?.[0] || null,
+    resolved_image: resolvedImage
+  };
+}
+
 /**
  * @route   GET /api/issues/my-issues
  * @desc    Get citizen's reported issues
@@ -449,7 +479,7 @@ router.get('/my-issues', authenticateToken, async (req, res) => {
 
     res.json({
       success: true,
-      data: { issues }
+      data: { issues: (issues || []).map(formatIssueWithProof) }
     });
 
   } catch (error) {
@@ -495,7 +525,7 @@ router.get('/:id', async (req, res) => {
 
     res.json({
       success: true,
-      data: { issue }
+      data: { issue: formatIssueWithProof(issue) }
     });
 
   } catch (error) {
@@ -536,7 +566,6 @@ function toRad(degrees) {
 router.get('/admin/department', async (req, res) => {
   try {
     const { department } = req.query;
-    const userId = req.user?.id || req.query.userId;
 
     if (!department) {
       return res.status(400).json({
@@ -550,7 +579,8 @@ router.get('/admin/department', async (req, res) => {
       .select(`
         *,
         citizen:users!issues_citizen_id_fkey(id, full_name, email, phone_number),
-        assigned_admin:users!issues_assigned_to_fkey(id, full_name, email)
+        assigned_admin:users!issues_assigned_to_fkey(id, full_name, email),
+        issue_updates(*)
       `)
       .eq('department', department)
       .order('reported_at', { ascending: false });
@@ -559,7 +589,7 @@ router.get('/admin/department', async (req, res) => {
 
     res.json({
       success: true,
-      data: { issues }
+      data: { issues: (issues || []).map(formatIssueWithProof) }
     });
 
   } catch (error) {
@@ -583,7 +613,8 @@ router.get('/all', async (req, res) => {
       .select(`
         *,
         citizen:users!issues_citizen_id_fkey(id, full_name, email, phone_number),
-        assigned_admin:users!issues_assigned_to_fkey(id, full_name, email)
+        assigned_admin:users!issues_assigned_to_fkey(id, full_name, email),
+        issue_updates(*)
       `)
       .order('reported_at', { ascending: false });
 
@@ -591,7 +622,7 @@ router.get('/all', async (req, res) => {
 
     res.json({
       success: true,
-      data: { issues }
+      data: { issues: (issues || []).map(formatIssueWithProof) }
     });
 
   } catch (error) {
@@ -603,21 +634,112 @@ router.get('/all', async (req, res) => {
   }
 });
 
+// Middleware to handle single image upload whether field name is 'resolved_image' or 'image'
+const handleResolvedUpload = (req, res, next) => {
+  const contentType = req.headers['content-type'] || '';
+  if (!contentType.includes('multipart/form-data')) {
+    return next();
+  }
+  upload.any()(req, res, (err) => {
+    if (err) {
+      console.error('Upload error in status patch:', err);
+      return res.status(400).json({ success: false, message: err.message || 'File upload error' });
+    }
+    if (req.files && req.files.length > 0) {
+      req.file = req.files.find(f => f.fieldname === 'resolved_image') || req.files.find(f => f.fieldname === 'image') || req.files[0];
+    }
+    next();
+  });
+};
+
 /**
  * @route   PATCH /api/issues/:id/status
- * @desc    Update issue status
- * @access  Private (Admin)
+ * @desc    Update issue status with required resolution proof image when resolved
+ * @access  Private (Admin / Super Admin)
  */
-router.patch('/:id/status', async (req, res) => {
+router.patch('/:id/status', handleResolvedUpload, async (req, res) => {
   try {
     const { id } = req.params;
     const { status, comment } = req.body;
     const userId = req.user?.id || req.body.userId;
 
-    const updateData = { status };
+    if (!status) {
+      return res.status(400).json({
+        success: false,
+        message: 'Status is required'
+      });
+    }
+
+    // Check if issue exists
+    const { data: existingIssue, error: fetchErr } = await supabase
+      .from('issues')
+      .select('id, images, status, citizen_id, title')
+      .eq('id', id)
+      .single();
+
+    if (fetchErr || !existingIssue) {
+      return res.status(404).json({
+        success: false,
+        message: 'Issue not found'
+      });
+    }
+
+    const file = req.file;
+
+    // When status is 'resolved', proof image is strictly REQUIRED.
+    // If the issue was already resolved and already has a resolution proof photo, allow keeping it if no new file is uploaded.
+    const hasExistingProof = existingIssue.status === 'resolved' && Array.isArray(existingIssue.images) && existingIssue.images.length > 1;
+    if (status === 'resolved' && !file && !hasExistingProof) {
+      return res.status(400).json({
+        success: false,
+        message: 'Proof of resolution image is required when marking an issue as resolved'
+      });
+    }
+
+    let publicUrl = null;
+    let updatedImages = existingIssue.images || [];
+
+    if (file) {
+      const cleanFileName = `resolved-${Date.now()}-${file.originalname.replace(/[^a-zA-Z0-9.-]/g, '_')}`;
+      const { error: uploadError } = await supabase.storage
+        .from('issue-images')
+        .upload(cleanFileName, file.buffer, {
+          contentType: file.mimetype,
+          upsert: false
+        });
+
+      if (uploadError) {
+        console.error('Resolution image upload error:', uploadError);
+        return res.status(500).json({
+          success: false,
+          message: 'Failed to upload resolution proof image: ' + uploadError.message
+        });
+      }
+
+      const { data: urlData } = supabase.storage
+        .from('issue-images')
+        .getPublicUrl(cleanFileName);
+
+      publicUrl = urlData.publicUrl;
+      // If updating an already-resolved issue with a new proof image, replace the last proof image
+      if (hasExistingProof) {
+        updatedImages = [...updatedImages.slice(0, -1), publicUrl];
+      } else {
+        updatedImages = [...updatedImages, publicUrl];
+      }
+    } else if (hasExistingProof && status === 'resolved') {
+      publicUrl = existingIssue.images[existingIssue.images.length - 1];
+    }
+
+    const updateData = { 
+      status,
+      images: updatedImages
+    };
     
     if (status === 'resolved') {
-      updateData.resolved_at = new Date().toISOString();
+      updateData.resolved_at = existingIssue.resolved_at || new Date().toISOString();
+    } else {
+      updateData.resolved_at = null;
     }
 
     const { data: issue, error } = await supabase
@@ -629,43 +751,59 @@ router.patch('/:id/status', async (req, res) => {
 
     if (error) throw error;
 
-    // Log status update
+    // Log status update with proof image tag in comment
+    const resolutionComment = publicUrl 
+      ? `[PROOF_IMAGE:${publicUrl}] ${comment || 'Issue marked as resolved with resolution proof photo'}`
+      : (comment || `Status updated to ${status}`);
+
     await supabase.from('issue_updates').insert({
       issue_id: id,
       user_id: userId,
       update_type: 'status_change',
+      old_value: existingIssue.status,
       new_value: status,
-      comment: comment || `Status updated to ${status}`
+      comment: resolutionComment
     });
 
     // Notify citizen about status change
     const statusMessages = {
       'assigned': 'Your issue has been assigned to an admin.',
       'in_progress': 'Work has started on your issue.',
-      'resolved': 'Your issue has been resolved!',
+      'resolved': 'Your issue has been resolved with proof photo attached!',
       'rejected': 'Your issue has been reviewed and rejected.',
       'closed': 'Your issue has been closed.'
     };
 
-    await supabase.from('notifications').insert({
-      user_id: issue.citizen_id,
-      title: `Issue ${status.replace('_', ' ').toUpperCase()}`,
-      message: `${statusMessages[status]} Issue: "${issue.title}"`,
-      type: 'status_update',
-      related_issue_id: id
-    });
+    if (issue.citizen_id) {
+      await supabase.from('notifications').insert({
+        user_id: issue.citizen_id,
+        title: `Issue ${status.replace('_', ' ').toUpperCase()}`,
+        message: `${statusMessages[status] || 'Status updated.'} Issue: "${issue.title}"`,
+        type: 'status_update',
+        related_issue_id: id
+      });
+    }
+
+    const finalResolvedImage = publicUrl || (issue.images?.length > 1 ? issue.images[issue.images.length - 1] : null);
 
     res.json({
       success: true,
       message: 'Issue status updated successfully',
-      data: { issue }
+      data: { 
+        resolved_image: finalResolvedImage,
+        issue: {
+          ...issue,
+          reported_image: issue.images?.[0] || null,
+          resolved_image: finalResolvedImage
+        } 
+      }
     });
 
   } catch (error) {
     console.error('Update status error:', error);
     res.status(500).json({
       success: false,
-      message: 'Failed to update issue status'
+      message: 'Failed to update issue status: ' + error.message
     });
   }
 });

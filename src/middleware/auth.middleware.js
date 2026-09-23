@@ -47,9 +47,9 @@ function authorizeRoles(...roles) {
   };
 }
 
-// Check if user is admin
+// Check if user is admin or super admin
 function isAdmin(req, res, next) {
-  if (!req.user || req.user.role !== 'admin') {
+  if (!req.user || (req.user.role !== 'admin' && req.user.role !== 'super_admin')) {
     return res.status(403).json({ 
       success: false, 
       message: 'Admin access required' 

@@ -5,6 +5,36 @@ const upload = require('../middleware/upload.middleware');
 
 const router = express.Router();
 
+// Get complaints for the currently logged-in citizen (authenticated)
+router.get('/my-complaints', authenticateToken, async (req, res) => {
+  try {
+    const userId = req.user.id;
+
+    const { data, error } = await supabase
+      .from('complaints')
+      .select(`
+        *,
+        department:departments(id, department_name, short_name)
+      `)
+      .eq('user_id', userId)
+      .order('created_at', { ascending: false });
+
+    if (error) throw error;
+
+    res.json({
+      success: true,
+      data: data || []
+    });
+  } catch (error) {
+    console.error('Get my complaints error:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Failed to fetch your complaints',
+      error: error.message
+    });
+  }
+});
+
 // Get all complaints (public)
 router.get('/', async (req, res) => {
   try {

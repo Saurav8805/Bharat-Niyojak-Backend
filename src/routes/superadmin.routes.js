@@ -19,30 +19,30 @@ const isSuperAdmin = (req, res, next) => {
 // Get dashboard statistics
 router.get('/stats', authenticateToken, isSuperAdmin, async (req, res) => {
   try {
-    // Get total complaints
-    const { data: complaints, error: complaintsError } = await supabase
-      .from('complaints')
+    // Get total complaints/issues from issues table
+    const { data: issues, error: issuesError } = await supabase
+      .from('issues')
       .select('status');
 
-    if (complaintsError) throw complaintsError;
+    if (issuesError) throw issuesError;
 
     // Calculate stats
     const stats = {
-      total_complaints: complaints?.length || 0,
-      pending: complaints?.filter(c => c.status === 'pending').length || 0,
-      in_progress: complaints?.filter(c => c.status === 'in_progress').length || 0,
-      resolved: complaints?.filter(c => c.status === 'resolved').length || 0,
-      rejected: complaints?.filter(c => c.status === 'rejected').length || 0
+      total_complaints: issues?.length || 0,
+      pending: issues?.filter(c => c.status === 'pending').length || 0,
+      in_progress: issues?.filter(c => c.status === 'in_progress').length || 0,
+      resolved: issues?.filter(c => c.status === 'resolved').length || 0,
+      rejected: issues?.filter(c => c.status === 'rejected').length || 0
     };
 
-    // Get user counts
+    // Get user counts from users table
     const { data: users, error: usersError } = await supabase
       .from('users')
       .select('role');
 
     if (usersError) throw usersError;
 
-    stats.total_admins = users?.filter(u => u.role.includes('admin') && u.role !== 'super_admin').length || 0;
+    stats.total_admins = users?.filter(u => u.role === 'admin' || (u.role?.includes('admin') && u.role !== 'super_admin')).length || 0;
     stats.total_citizens = users?.filter(u => u.role === 'citizen').length || 0;
 
     res.json({
@@ -62,23 +62,38 @@ router.get('/stats', authenticateToken, isSuperAdmin, async (req, res) => {
 // Get department-wise statistics
 router.get('/department-stats', authenticateToken, isSuperAdmin, async (req, res) => {
   try {
-    const { data: complaints, error } = await supabase
-      .from('complaints')
-      .select('department_id, status, departments(department_name)');
+    const { data: issues, error } = await supabase
+      .from('issues')
+      .select('department, status');
 
     if (error) throw error;
 
-    // Group by department
-    const deptStats = {};
-    complaints?.forEach(complaint => {
-      const deptName = complaint.departments?.department_name || 'Unknown';
+    // Pre-populate all 4 core departments so all appear on the dashboard
+    const deptStats = {
+      Road: { total: 0, pending: 0, in_progress: 0, resolved: 0, rejected: 0 },
+      Water: { total: 0, pending: 0, in_progress: 0, resolved: 0, rejected: 0 },
+      Electricity: { total: 0, pending: 0, in_progress: 0, resolved: 0, rejected: 0 },
+      Forest: { total: 0, pending: 0, in_progress: 0, resolved: 0, rejected: 0 }
+    };
+
+    // Group issues by department
+    issues?.forEach(issue => {
+      let deptName = 'Other';
+      const rawDept = (issue.department || '').toLowerCase().trim();
+      if (rawDept === 'road') deptName = 'Road';
+      else if (rawDept === 'water') deptName = 'Water';
+      else if (rawDept === 'electric' || rawDept === 'electricity') deptName = 'Electricity';
+      else if (rawDept === 'forest') deptName = 'Forest';
+      else if (rawDept) deptName = rawDept.charAt(0).toUpperCase() + rawDept.slice(1);
+
       if (!deptStats[deptName]) {
-        deptStats[deptName] = { total: 0, pending: 0, resolved: 0, in_progress: 0 };
+        deptStats[deptName] = { total: 0, pending: 0, in_progress: 0, resolved: 0, rejected: 0 };
       }
       deptStats[deptName].total++;
-      if (complaint.status === 'pending') deptStats[deptName].pending++;
-      if (complaint.status === 'resolved') deptStats[deptName].resolved++;
-      if (complaint.status === 'in_progress') deptStats[deptName].in_progress++;
+      if (issue.status === 'pending') deptStats[deptName].pending++;
+      else if (issue.status === 'in_progress') deptStats[deptName].in_progress++;
+      else if (issue.status === 'resolved') deptStats[deptName].resolved++;
+      else if (issue.status === 'rejected') deptStats[deptName].rejected++;
     });
 
     res.json({
@@ -95,26 +110,181 @@ router.get('/department-stats', authenticateToken, isSuperAdmin, async (req, res
   }
 });
 
-// Get all admins
+// 14 Civic Issue Departments mapping
+const CIVIC_DEPARTMENTS = [
+  {
+    key: 'road_pwd',
+    name: 'Municipal Corporation / PWD',
+    category: 'Roads & Potholes',
+    icon: '🛣️',
+    baseDepartment: 'road'
+  },
+  {
+    key: 'streetlights',
+    name: 'Municipal Corporation – Electrical Department',
+    category: 'Streetlights',
+    icon: '💡',
+    baseDepartment: 'electric'
+  },
+  {
+    key: 'water_supply',
+    name: 'Municipal Water Supply Department',
+    category: 'Water Supply',
+    icon: '🚰',
+    baseDepartment: 'water'
+  },
+  {
+    key: 'drainage_sewerage',
+    name: 'Municipal Corporation – Drainage Department',
+    category: 'Drainage & Sewerage',
+    icon: '🕳️',
+    baseDepartment: 'water'
+  },
+  {
+    key: 'solid_waste',
+    name: 'Municipal Corporation – Solid Waste Management Department',
+    category: 'Solid Waste / Garbage',
+    icon: '🗑️',
+    baseDepartment: 'road'
+  },
+  {
+    key: 'trees_parks',
+    name: 'Municipal Corporation – Garden / Tree Authority Department',
+    category: 'Trees & Parks',
+    icon: '🌳',
+    baseDepartment: 'forest'
+  },
+  {
+    key: 'traffic_safety',
+    name: 'Traffic Police / Municipal Corporation',
+    category: 'Traffic & Road Safety',
+    icon: '🚦',
+    baseDepartment: 'road'
+  },
+  {
+    key: 'illegal_construction',
+    name: 'Municipal Corporation – Encroachment / Town Planning Dept',
+    category: 'Illegal Construction / Encroachment',
+    icon: '🏗️',
+    baseDepartment: 'road'
+  },
+  {
+    key: 'health_sanitation',
+    name: 'Municipal Corporation – Public Health Department',
+    category: 'Public Health & Sanitation',
+    icon: '🦟',
+    baseDepartment: 'water'
+  },
+  {
+    key: 'pollution_control',
+    name: 'State Pollution Control Board (SPCB) / Municipal Corp',
+    category: 'Air & Environmental Pollution',
+    icon: '🌫️',
+    baseDepartment: 'forest'
+  },
+  {
+    key: 'flooding_disaster',
+    name: 'Municipal Corporation / Disaster Management Cell',
+    category: 'Flooding & Waterlogging',
+    icon: '🌊',
+    baseDepartment: 'water'
+  },
+  {
+    key: 'stray_animals',
+    name: 'Municipal Corporation – Veterinary Department',
+    category: 'Stray Animals & Animal Nuisance',
+    icon: '🐕',
+    baseDepartment: 'forest'
+  },
+  {
+    key: 'electricity_infra',
+    name: 'State Electricity Board (MSEDCL / Electricity Dist.)',
+    category: 'Electricity Infrastructure',
+    icon: '⚡',
+    baseDepartment: 'electric'
+  },
+  {
+    key: 'fire_emergency',
+    name: 'Municipal Fire & Emergency Services',
+    category: 'Fire & Emergency Safety',
+    icon: '🔥',
+    baseDepartment: 'road'
+  }
+];
+
+const findCivicDept = (input) => {
+  if (!input) return null;
+  const lower = String(input).toLowerCase().trim();
+  let found = CIVIC_DEPARTMENTS.find(d => d.key.toLowerCase() === lower);
+  if (found) return found;
+  found = CIVIC_DEPARTMENTS.find(d => d.name.toLowerCase() === lower || d.category.toLowerCase() === lower);
+  if (found) return found;
+  if (lower === 'road') return CIVIC_DEPARTMENTS.find(d => d.key === 'road_pwd');
+  if (lower === 'water') return CIVIC_DEPARTMENTS.find(d => d.key === 'water_supply');
+  if (lower === 'electric' || lower === 'electricity') return CIVIC_DEPARTMENTS.find(d => d.key === 'electricity_infra');
+  if (lower === 'forest') return CIVIC_DEPARTMENTS.find(d => d.key === 'trees_parks');
+  found = CIVIC_DEPARTMENTS.find(d => d.baseDepartment === lower);
+  return found || null;
+};
+
+// Get list of all supported civic departments
+router.get('/departments', authenticateToken, isSuperAdmin, async (req, res) => {
+  res.json({
+    success: true,
+    data: CIVIC_DEPARTMENTS
+  });
+});
+
+// Get all department admins
 router.get('/admins', authenticateToken, isSuperAdmin, async (req, res) => {
   try {
     const { data, error } = await supabase
       .from('users')
-      .select('id, full_name, email, phone_number, role, is_active, created_at')
-      .in('role', ['road_admin', 'water_admin', 'electricity_admin', 'forest_admin'])
+      .select('id, full_name, email, phone_number, role, department, avatar_url, is_active, created_at')
+      .eq('role', 'admin')
       .order('created_at', { ascending: false });
 
     if (error) throw error;
 
-    // Add department field based on role
-    const adminsWithDept = data?.map(admin => ({
-      ...admin,
-      department: admin.role.replace('_admin', '')
-    }));
+    // Normalize department display with civic metadata
+    const adminsWithDept = data?.map(admin => {
+      let dept = admin.department || '';
+      if (dept === 'electric') dept = 'electricity';
+
+      let meta = null;
+      if (admin.avatar_url && typeof admin.avatar_url === 'string' && admin.avatar_url.trim().startsWith('{')) {
+        try {
+          meta = JSON.parse(admin.avatar_url);
+        } catch (e) {
+          meta = null;
+        }
+      }
+
+      if (meta && meta.dept_key) {
+        return {
+          ...admin,
+          department: dept,
+          dept_key: meta.dept_key,
+          department_display: meta.dept_name,
+          civic_category: meta.category,
+          icon: meta.icon
+        };
+      }
+
+      const deptInfo = findCivicDept(admin.department) || findCivicDept(dept);
+      return {
+        ...admin,
+        department: dept || (admin.role ? admin.role.replace('_admin', '') : 'general'),
+        dept_key: deptInfo ? deptInfo.key : dept,
+        department_display: deptInfo ? deptInfo.name : (dept.charAt(0).toUpperCase() + dept.slice(1) + ' Department'),
+        civic_category: deptInfo ? deptInfo.category : 'Civic Administration',
+        icon: deptInfo ? deptInfo.icon : '🏛️'
+      };
+    });
 
     res.json({
       success: true,
-      data: adminsWithDept
+      data: adminsWithDept || []
     });
   } catch (error) {
     console.error('Get admins error:', error);
@@ -158,8 +328,9 @@ router.post('/admins', authenticateToken, isSuperAdmin, async (req, res) => {
 
     // Validate phone number (10 digits, starting with 6-9)
     if (phone_number) {
+      const cleanPhone = phone_number.replace(/^\+91-?/, '').trim();
       const phoneRegex = /^[6-9]\d{9}$/;
-      if (!phoneRegex.test(phone_number)) {
+      if (!phoneRegex.test(cleanPhone) && !/^\d{10}$/.test(cleanPhone)) {
         return res.status(400).json({
           success: false,
           message: 'Invalid phone number. Must be 10 digits starting with 6-9'
@@ -175,14 +346,23 @@ router.post('/admins', authenticateToken, isSuperAdmin, async (req, res) => {
       });
     }
 
-    // Validate department
-    const validDepartments = ['road', 'water', 'electricity', 'forest'];
-    if (!validDepartments.includes(department)) {
+    // Match department from CIVIC_DEPARTMENTS or legacy
+    const deptInfo = findCivicDept(department);
+    if (!deptInfo) {
       return res.status(400).json({
         success: false,
-        message: 'Invalid department. Must be one of: road, water, electricity, forest'
+        message: 'Invalid department selected'
       });
     }
+
+    // Base enum value for PostgreSQL ('road', 'electric', 'water', 'forest')
+    const normalizedDept = deptInfo.baseDepartment;
+    const deptMeta = JSON.stringify({
+      dept_key: deptInfo.key,
+      dept_name: deptInfo.name,
+      category: deptInfo.category,
+      icon: deptInfo.icon
+    });
 
     // Check if email already exists
     const { data: existingUser } = await supabase
@@ -202,21 +382,20 @@ router.post('/admins', authenticateToken, isSuperAdmin, async (req, res) => {
     const salt = await bcrypt.genSalt(10);
     const password_hash = await bcrypt.hash(password, salt);
 
-    // Determine role based on department
-    const role = `${department}_admin`;
-
-    // Create admin
+    // Create admin in users table with role 'admin'
     const { data, error } = await supabase
       .from('users')
       .insert({
-        full_name,
-        email,
-        phone_number,
+        full_name: full_name.trim(),
+        email: email.toLowerCase().trim(),
+        phone_number: phone_number || null,
         password_hash,
-        role,
+        role: 'admin',
+        department: normalizedDept,
+        avatar_url: deptMeta,
         is_active: true
       })
-      .select()
+      .select('id, full_name, email, phone_number, role, department, is_active, created_at')
       .single();
 
     if (error) throw error;
@@ -226,7 +405,11 @@ router.post('/admins', authenticateToken, isSuperAdmin, async (req, res) => {
       message: 'Admin created successfully',
       data: {
         ...data,
-        department
+        department: normalizedDept === 'electric' ? 'electricity' : normalizedDept,
+        dept_key: deptInfo.key,
+        department_display: deptInfo.name,
+        civic_category: deptInfo.category,
+        icon: deptInfo.icon
       }
     });
   } catch (error) {
@@ -281,8 +464,8 @@ router.put('/admins/:id', authenticateToken, isSuperAdmin, async (req, res) => {
 
     // Validate phone number if provided
     if (phone_number) {
-      const phoneRegex = /^[6-9]\d{9}$/;
-      if (!phoneRegex.test(phone_number)) {
+      const cleanPhone = phone_number.replace(/^\+91-?/, '').trim();
+      if (!/^[6-9]\d{9}$/.test(cleanPhone) && !/^\d{10}$/.test(cleanPhone)) {
         return res.status(400).json({
           success: false,
           message: 'Invalid phone number. Must be 10 digits starting with 6-9'
@@ -290,24 +473,32 @@ router.put('/admins/:id', authenticateToken, isSuperAdmin, async (req, res) => {
       }
     }
 
-    // Validate department if provided
+    let normalizedDept = undefined;
+    let deptMeta = undefined;
+    let deptInfo = null;
     if (department) {
-      const validDepartments = ['road', 'water', 'electricity', 'forest'];
-      if (!validDepartments.includes(department)) {
+      deptInfo = findCivicDept(department);
+      if (!deptInfo) {
         return res.status(400).json({
           success: false,
-          message: 'Invalid department. Must be one of: road, water, electricity, forest'
+          message: 'Invalid department selected'
         });
       }
+      normalizedDept = deptInfo.baseDepartment;
+      deptMeta = JSON.stringify({
+        dept_key: deptInfo.key,
+        dept_name: deptInfo.name,
+        category: deptInfo.category,
+        icon: deptInfo.icon
+      });
     }
 
-    const role = department ? `${department}_admin` : undefined;
-
     const updateData = {
-      ...(full_name && { full_name }),
-      ...(email && { email }),
+      ...(full_name && { full_name: full_name.trim() }),
+      ...(email && { email: email.toLowerCase().trim() }),
       ...(phone_number !== undefined && { phone_number }),
-      ...(role && { role }),
+      ...(normalizedDept && { department: normalizedDept }),
+      ...(deptMeta && { avatar_url: deptMeta }),
       ...(is_active !== undefined && { is_active })
     };
 
@@ -315,7 +506,7 @@ router.put('/admins/:id', authenticateToken, isSuperAdmin, async (req, res) => {
       .from('users')
       .update(updateData)
       .eq('id', id)
-      .select()
+      .select('id, full_name, email, phone_number, role, department, is_active, created_at')
       .single();
 
     if (error) throw error;
@@ -323,7 +514,16 @@ router.put('/admins/:id', authenticateToken, isSuperAdmin, async (req, res) => {
     res.json({
       success: true,
       message: 'Admin updated successfully',
-      data
+      data: {
+        ...data,
+        department: data.department === 'electric' ? 'electricity' : data.department,
+        ...(deptInfo && {
+          dept_key: deptInfo.key,
+          department_display: deptInfo.name,
+          civic_category: deptInfo.category,
+          icon: deptInfo.icon
+        })
+      }
     });
   } catch (error) {
     console.error('Update admin error:', error);
@@ -361,30 +561,79 @@ router.delete('/admins/:id', authenticateToken, isSuperAdmin, async (req, res) =
   }
 });
 
-// Get all complaints with filters
+// Get all complaints (citizen reported issues) with filters
 router.get('/complaints', authenticateToken, isSuperAdmin, async (req, res) => {
   try {
     const { status, department } = req.query;
 
     let query = supabase
-      .from('complaints')
+      .from('issues')
       .select(`
         *,
-        user:users(id, full_name, email),
-        department:departments(id, department_name)
+        citizen:users!citizen_id(id, full_name, email, phone_number),
+        issue_updates(*)
       `)
       .order('created_at', { ascending: false });
 
-    if (status) query = query.eq('status', status);
-    if (department) query = query.eq('department_id', department);
+    if (status && status !== 'all' && status !== '') {
+      query = query.eq('status', status);
+    }
+
+    if (department && department !== 'all' && department !== '') {
+      const deptNormalized = (department.toLowerCase() === 'electricity' || department.toLowerCase() === 'electric') 
+        ? 'electric' 
+        : department.toLowerCase();
+      query = query.eq('department', deptNormalized);
+    }
 
     const { data, error } = await query;
 
     if (error) throw error;
 
+    // Map issues to complaint structure expected by frontend
+    const complaints = (data || []).map(issue => {
+      const deptDisplay = issue.department === 'electric'
+        ? 'Electricity'
+        : (issue.department ? issue.department.charAt(0).toUpperCase() + issue.department.slice(1) : 'General');
+
+      let resolvedImage = null;
+      if (issue.issue_updates && Array.isArray(issue.issue_updates)) {
+        for (const update of issue.issue_updates) {
+          if (update.comment && update.comment.includes('[PROOF_IMAGE:')) {
+            const match = update.comment.match(/\[PROOF_IMAGE:(.*?)\]/);
+            if (match && match[1]) {
+              resolvedImage = match[1].trim();
+              break;
+            }
+          }
+        }
+      }
+      if (!resolvedImage && (issue.status === 'resolved' || issue.resolved_at) && Array.isArray(issue.images) && issue.images.length > 1) {
+        resolvedImage = issue.images[issue.images.length - 1];
+      }
+
+      return {
+        ...issue,
+        category: issue.title || issue.category || 'General Issue',
+        reported_image: issue.images?.[0] || null,
+        resolved_image: resolvedImage,
+        user: issue.citizen ? {
+          id: issue.citizen.id,
+          full_name: issue.citizen.full_name,
+          email: issue.citizen.email,
+          phone_number: issue.citizen.phone_number
+        } : { full_name: 'Anonymous Citizen', email: 'N/A' },
+        department: {
+          id: issue.department,
+          department_name: deptDisplay
+        },
+        department_name: deptDisplay
+      };
+    });
+
     res.json({
       success: true,
-      data: data || []
+      data: complaints
     });
   } catch (error) {
     console.error('Get complaints error:', error);
